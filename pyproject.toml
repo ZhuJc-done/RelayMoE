@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relaymoe-sim"
+version = "0.1.0"
+description = "Stage-level simulator for RelayMoE relay-tree scheduling on hierarchical PCIe GPU clusters"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+relaymoe-sim = "relaymoe.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["relaymoe*"]
