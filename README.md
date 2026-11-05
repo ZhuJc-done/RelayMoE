@@ -1,72 +1,51 @@
-# RelayMoE Simulation Prototype
+# RelayMoE
 
-这是一个可运行、无第三方依赖的 RelayMoE 通信仿真原型。默认路径包含：
+- 可持久化的离线二项中继树目录；
+- 在线 TrafficClass 聚合、势函数选树及 GPU/NIC 绑定；
+- 保留父子依赖和具体 NIC 路径的事件驱动、有向链路独占调度；
+- 对称反向 Combine DAG 与中间节点部分归约元数据；
+- 面向真实 MoE 层的 `plan → dispatch → expert compute → combine` 接口；
+- NCCL、CollWay、DeepEP 通信仿真基线。
 
-1. 分层、全双工、有向 PCIe/NIC 拓扑；
-2. 每个 token 独立随机 Top-k 的精确 gate trace；
-3. NCCL、拓扑感知 matching 的 CollWay、DeepEP 与 RelayMoE 通信模板；
-4. 流完成后立即回收带宽的动态 max-min 流体仿真；
-5. 细粒度 token pipeline 与物理传输字节统计。
+## MoE 上层接口
 
-## Quick start
+```python
+relaymoe = RelayMoE(topology, backend=my_cuda_rdma_backend)
+plan = relaymoe.plan_from_gating(
+    expert_indices_by_gpu,       # [EP rank][local token][Top-k]
+    expert_to_gpu=expert_to_gpu,
+    expert_weights_by_gpu=gate_weights,
+    activation_bytes=hidden_bytes,
+)
 
-```bash
-cd /home/tiger/RelayMoE
-python3 -m relaymoe
-python3 -m relaymoe --tokens-per-gpu 4096 --top-k 8
-python3 -m relaymoe --nccl-contention-loss 0
-python3 -m relaymoe --json
-python3 -m relaymoe --legacy-stage-model
-python3 -m examples.custom_scenario
+dispatched = relaymoe.dispatch(plan, hidden_states)
+expert_outputs = experts(dispatched)
+outputs = relaymoe.combine(plan, expert_outputs)
 ```
 
-也可以安装命令行入口：
+`RelayMoEPlan` 同时保留 token/expert membership、树边依赖、源/目的 GPU、
+具体 NIC 路径以及 Combine 部分归约信息。真实 CUDA/RDMA 实现只需实现
+`RelayMoEBackend.execute()`。完整示例位于 `examples/moe_integration.py`。
 
-```bash
-python3 -m pip install -e .
-relaymoe-sim --help
-```
+## 测试结果
 
-运行测试：
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-## 默认实验
-
-默认构造：
-
-- 2 个节点；
-- 每节点 4 个 PCIe switch；
-- 每 switch 4 张 GPU，共 32 张 GPU；
-- EP size 为 32，32 个专家按 round-robin 放置，即每 GPU 1 个专家；
-- 每 GPU 4096 个 token，共 131072 个 token；
-- 每个 token 使用独立随机数无放回选择 8 个专家；
-- 每份 token activation 为 1024 B；
-- GPU 端口与 switch 间 PXB 均为 64 GB/s；
-- 每个 switch 下挂 2 张 50 GB/s NIC，仿真为 100 GB/s 聚合 TX/RX；
-- 每个有向节点对共享 400 GB/s 的网络边。
-
-
-程序比较四种策略：
-
-- `nccl`：每个 source-destination 直接点到点发送，全部 flow 无协调地并发；
-- `collway`：物理字节仍与 direct 相同，但先把通信对分解成拓扑感知的
-  one-to-one matching；每个 step 每张 GPU 至多一发一收；
-- `deepep`：每个远端节点使用一个固定入口 GPU，跨节点只发一份，
-  再由入口 GPU 在目标节点内转发；
-- `relaymoe`：每个 token 根据自己的目的专家选择最多两个 node ingress，
-  由真实 destination GPU 作为 switch relay，并进行细粒度流水。
+测试配置：2 节点 × 16 GPU（EP=32），每节点 4 个 PCIe Switch、每个
+Switch 4 张 GPU 和 2 张 50 GB/s NIC；每 GPU 512 tokens，Top-8，
+32 experts，激活大小 1 KiB，`routing-motifs-per-gpu=8`，`seed=7`。
 
 ```text
-strategy     dispatch(us)   combine(us)    total(us)   AlgoBW(GB/s)   physical(MiB)
-nccl               712.86        712.86      1425.73        1459.10         7806.07
-collway            702.96        702.96      1405.92        1479.66         7806.07
-deepep             618.65        618.65      1237.31        1681.29         6655.68
-relaymoe             532.77        532.77      1065.53        1952.34         6230.06
+策略          Dispatch(us)  Combine(us)  Total(us)  RelayMoE 加速比
+CollWay-like       193.16       193.16     386.31          2.143x
+DeepEP-like        122.06       122.06     244.12          1.354x
+RelayMoE             90.88        89.43     180.30               -
+```
 
-RelayMoE speedup vs NCCL-like:       1.338x
-RelayMoE speedup vs CollWay-like:    1.319x
-RelayMoE speedup vs DeepEP-like:       1.161x
+复现命令：
+
+```bash
+python3 -m relaymoe \
+  --tokens-per-gpu 512 \
+  --routing-motifs-per-gpu 8 \
+  --nccl-contention-loss 0
+python3 -m unittest discover -s tests -v  # 23 tests
 ```

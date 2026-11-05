@@ -57,6 +57,12 @@ class HierarchicalTopology:
     pxb_edges: dict[tuple[str, str], str] = field(default_factory=dict)
     nic_tx_edges: dict[str, str] = field(default_factory=dict)
     nic_rx_edges: dict[str, str] = field(default_factory=dict)
+    nic_tx_edges_by_switch: dict[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
+    nic_rx_edges_by_switch: dict[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
     network_edges: dict[tuple[str, str], str] = field(default_factory=dict)
 
     def add_gpu(
@@ -118,9 +124,13 @@ class HierarchicalTopology:
         *,
         bandwidth_GBps: float,
         latency_us: float = 0.8,
+        nics_per_switch: int = 1,
+        per_nic_bandwidth_GBps: float | None = None,
     ) -> None:
         if switch in self.nic_tx_edges or switch in self.nic_rx_edges:
             raise ValueError(f"NIC edges already exist for switch {switch}")
+        if nics_per_switch < 1:
+            raise ValueError("nics_per_switch must be positive")
         fabric_name = f"fabric:{self.switch_node(switch)}"
         tx_name = f"nic:{switch}:tx"
         rx_name = f"nic:{switch}:rx"
@@ -146,6 +156,40 @@ class HierarchicalTopology:
         )
         self.nic_tx_edges[switch] = tx_name
         self.nic_rx_edges[switch] = rx_name
+        unit_bw = (
+            per_nic_bandwidth_GBps
+            if per_nic_bandwidth_GBps is not None
+            else bandwidth_GBps / nics_per_switch
+        )
+        tx_group: list[str] = []
+        rx_group: list[str] = []
+        for nic_index in range(nics_per_switch):
+            dev_tx = f"nic:{switch}:{nic_index}:tx"
+            dev_rx = f"nic:{switch}:{nic_index}:rx"
+            self._add_edge(
+                PhysicalEdge(
+                    dev_tx,
+                    switch,
+                    fabric_name,
+                    unit_bw,
+                    latency_us,
+                    "nic_dev_tx",
+                )
+            )
+            self._add_edge(
+                PhysicalEdge(
+                    dev_rx,
+                    fabric_name,
+                    switch,
+                    unit_bw,
+                    latency_us,
+                    "nic_dev_rx",
+                )
+            )
+            tx_group.append(dev_tx)
+            rx_group.append(dev_rx)
+        self.nic_tx_edges_by_switch[switch] = tuple(tx_group)
+        self.nic_rx_edges_by_switch[switch] = tuple(rx_group)
 
     def add_network_pair(
         self,
@@ -184,7 +228,15 @@ class HierarchicalTopology:
             )
         return next(iter(nodes))
 
-    def route(self, src_gpu: str, dst_gpu: str) -> tuple[str, ...]:
+    def route(
+        self,
+        src_gpu: str,
+        dst_gpu: str,
+        *,
+        src_nic_edge: str | None = None,
+        dst_nic_edge: str | None = None,
+        include_network_edge: bool = True,
+    ) -> tuple[str, ...]:
         if src_gpu == dst_gpu:
             return ()
         try:
@@ -206,19 +258,52 @@ class HierarchicalTopology:
             path.append(self.gpu_down_edges[dst.name])
         else:
             try:
-                path.extend(
-                    (
-                        self.nic_tx_edges[src.switch],
-                        self.network_edges[(src.node, dst.node)],
-                        self.nic_rx_edges[dst.switch],
-                        self.gpu_down_edges[dst.name],
-                    )
+                tx_edge = (
+                    src_nic_edge
+                    if src_nic_edge is not None
+                    else self.nic_tx_edges[src.switch]
                 )
+                rx_edge = (
+                    dst_nic_edge
+                    if dst_nic_edge is not None
+                    else self.nic_rx_edges[dst.switch]
+                )
+                if include_network_edge:
+                    path.extend(
+                        (
+                            tx_edge,
+                            self.network_edges[(src.node, dst.node)],
+                            rx_edge,
+                            self.gpu_down_edges[dst.name],
+                        )
+                    )
+                else:
+                    path.extend(
+                        (
+                            tx_edge,
+                            rx_edge,
+                            self.gpu_down_edges[dst.name],
+                        )
+                    )
             except KeyError as exc:
                 raise ValueError(
                     f"missing cross-node route {src.name}->{dst.name}"
                 ) from exc
         return tuple(path)
+
+    def model_directed_edges(self) -> tuple[str, ...]:
+        """Return the five directed edge classes E in Model Section 1."""
+
+        result: list[str] = []
+        for gpu_name in self.gpus:
+            result.append(self.gpu_up_edges[gpu_name])
+            result.append(self.gpu_down_edges[gpu_name])
+        for edge_name in self.pxb_edges.values():
+            result.append(edge_name)
+        for switch in self.switches():
+            result.extend(self.nic_tx_edges_by_switch.get(switch, ()))
+            result.extend(self.nic_rx_edges_by_switch.get(switch, ()))
+        return tuple(result)
 
     def route_latency_us(self, edge_names: Iterable[str]) -> float:
         return sum(self.edges[name].latency_us for name in edge_names)

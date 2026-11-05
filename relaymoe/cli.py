@@ -79,6 +79,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--tokens-per-gpu", type=int, default=4096)
     parser.add_argument("--activation-bytes", type=int, default=1024)
+    parser.add_argument(
+        "--routing-motifs-per-gpu",
+        type=int,
+        default=0,
+        help=(
+            "number of Top-k expert routing motifs per GPU for skewed routing "
+            "experiments (0 = default independent uniform Top-k per token)"
+        ),
+    )
     parser.add_argument("--tree-entries-per-node", type=int, default=2)
     parser.add_argument("--min-volume-mib", type=float, default=0.5)
     parser.add_argument("--max-volume-mib", type=float, default=4.0)
@@ -90,6 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--network-bandwidth-gbps", type=float, default=400.0)
     parser.add_argument("--stage-launch-us", type=float, default=1.5)
     parser.add_argument("--relay-overhead-us", type=float, default=0.35)
+    parser.add_argument(
+        "--relaymoe-execution",
+        choices=("event_driven", "fluid"),
+        default="event_driven",
+        help=(
+            "RelayMoE execution model: latest dependency-aware exclusive-edge "
+            "scheduler (default) or the earlier fluid approximation"
+        ),
+    )
     parser.add_argument(
         "--nccl-contention-loss",
         type=float,
@@ -129,6 +147,8 @@ def run_experiment(args: argparse.Namespace):
             args.nics_per_switch * args.nic_bandwidth_gbps
         ),
         network_bandwidth_GBps=args.network_bandwidth_gbps,
+        nics_per_switch=args.nics_per_switch,
+        per_nic_bandwidth_GBps=args.nic_bandwidth_gbps,
     )
     workload = generate_moe_workload(
         topology,
@@ -226,6 +246,8 @@ def _run_token_cli(args: argparse.Namespace) -> int:
             args.nics_per_switch * args.nic_bandwidth_gbps
         ),
         network_bandwidth_GBps=args.network_bandwidth_gbps,
+        nics_per_switch=args.nics_per_switch,
+        per_nic_bandwidth_GBps=args.nic_bandwidth_gbps,
     )
     routing = generate_token_routing(
         topology,
@@ -234,15 +256,18 @@ def _run_token_cli(args: argparse.Namespace) -> int:
         experts=args.experts,
         activation_bytes=args.activation_bytes,
         seed=args.seed,
+        routing_motifs_per_gpu=args.routing_motifs_per_gpu,
     )
     results = simulate_token_strategies(
         topology,
         routing,
         config=TokenSimulationConfig(
             launch_overhead_us=args.stage_launch_us,
+            relay_overhead_us=args.relay_overhead_us,
             include_path_latency=True,
             tree_entries_per_node=args.tree_entries_per_node,
             pipeline_tokens=True,
+            relaymoe_execution=args.relaymoe_execution,
             nccl_uncoordinated_contention_loss=(
                 args.nccl_contention_loss
             ),
@@ -270,7 +295,8 @@ def _run_token_cli(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
-                    "model": "exact-token-fluid-pipeline",
+                    "model": "exact-token-communication",
+                    "relaymoe_execution": args.relaymoe_execution,
                     "contention_model": {
                         "nccl_uncoordinated_maximum_loss": (
                             args.nccl_contention_loss
@@ -355,8 +381,13 @@ def _run_token_cli(args: argparse.Namespace) -> int:
         f"{results['nccl'].dispatch.useful_bytes / 2**20:.2f} MiB/phase"
     )
     print(
-        "Execution model: dynamic max-min bandwidth with completion-time "
-        "reallocation; fine-grained token pipeline; network-only."
+        "Execution model: baselines use dynamic max-min bandwidth sharing; "
+        "RelayMoE uses "
+        + (
+            "dependency-aware, directed-edge-exclusive event scheduling."
+            if args.relaymoe_execution == "event_driven"
+            else "the earlier fluid-pipeline approximation."
+        )
     )
     print(
         "NCCL uncoordinated-contention loss ceiling: "
@@ -366,7 +397,7 @@ def _run_token_cli(args: argparse.Namespace) -> int:
     print()
     print(
         f"{'strategy':<10} {'dispatch(us)':>14} {'combine(us)':>13} "
-        f"{'total(us)':>12} {'AlgoBW(GB/s)':>14} "
+        f"{'total(us)':>12} {'T_max(us)':>11} {'AlgoBW(GB/s)':>14} "
         f"{'physical(MiB)':>15}"
     )
     for name in ("nccl", "collway", "deepep", "relaymoe"):
@@ -376,6 +407,7 @@ def _run_token_cli(args: argparse.Namespace) -> int:
             f"{summary['dispatch_time_us']:>14.2f} "
             f"{summary['combine_time_us']:>13.2f} "
             f"{summary['total_time_us']:>12.2f} "
+            f"{summary['max_dispatch_edge_load_us']:>11.2f} "
             f"{summary['dispatch_algobw_GBps']:>14.2f} "
             f"{summary['total_physical_bytes'] / 2**20:>15.2f}"
         )
@@ -400,10 +432,17 @@ def _run_token_cli(args: argparse.Namespace) -> int:
         f"{results['relaymoe'].total_physical_bytes / direct_bytes:.3f} "
         "vs direct"
     )
+    if results["relaymoe"].planning_time_us > 0:
+        print(
+            "RelayMoE Python planning time: "
+            f"{results['relaymoe'].planning_time_us:.2f} us "
+            "(not included in communication latency)."
+        )
     print(
-        "Note: reduction/compute is excluded equally for all strategies; "
-        "the earlier traffic-class stage model remains available with "
-        "--legacy-stage-model."
+        "Note: reported latency is the communication-path model and excludes "
+        "online planning, tensor packing, expert compute, and backend kernel "
+        "costs not configured above. The earlier traffic-class stage model "
+        "remains available with --legacy-stage-model."
     )
     return 0
 
@@ -413,6 +452,8 @@ def _token_summary(result) -> dict:
         "dispatch_time_us": result.dispatch.total_time_us,
         "combine_time_us": result.combine.total_time_us,
         "total_time_us": result.total_time_us,
+        "planning_time_us": result.planning_time_us,
+        "max_dispatch_edge_load_us": result.dispatch.max_edge_load_us,
         "dispatch_algobw_GBps": (
             result.dispatch.effective_algobw_GBps
         ),

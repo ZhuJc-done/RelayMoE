@@ -1,4 +1,4 @@
-"""RelayMoE stage-level communication simulator."""
+"""RelayMoE planner, runtime interface, and communication simulator."""
 
 from .baselines import (
     BaselinePlan,
@@ -21,6 +21,14 @@ from .scenarios import (
     generate_moe_workload,
     generate_token_routing,
 )
+from .runtime import (
+    ExecutionDAG,
+    RelayMoE,
+    RelayMoEBackend,
+    RelayMoEPlan,
+    RelayMoESimulationResult,
+    TrafficClassLayout,
+)
 from .scheduler import PotentialGreedyScheduler, Schedule, SelectionResult
 from .simulator import SimulationConfig, SimulationResult, StageSimulator
 from .token_simulator import (
@@ -35,6 +43,7 @@ __all__ = [
     "CandidateTreeCatalog",
     "CollWayBaseline",
     "DeepEPBaseline",
+    "ExecutionDAG",
     "Gpu",
     "HierarchicalTopology",
     "LogicalArc",
@@ -43,6 +52,10 @@ __all__ = [
     "PhysicalEdge",
     "PotentialGreedyScheduler",
     "RelayTree",
+    "RelayMoE",
+    "RelayMoEBackend",
+    "RelayMoEPlan",
+    "RelayMoESimulationResult",
     "Schedule",
     "SelectionResult",
     "SimulationConfig",
@@ -52,6 +65,7 @@ __all__ = [
     "TokenRouting",
     "TokenSimulationConfig",
     "TokenStrategyResult",
+    "TrafficClassLayout",
     "TrafficClass",
     "generate_moe_workload",
     "generate_token_routing",

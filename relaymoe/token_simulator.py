@@ -7,8 +7,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
+from .catalog import OfflineBinomialCatalog
 from .model import HierarchicalTopology
+from .runtime import RelayMoE
 from .scenarios import TokenRouting
+from .scheduler import EventDrivenPhaseResult
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,7 @@ class TokenPhaseResult:
     edge_bytes: Mapping[str, int]
     edge_peak_concurrency: Mapping[str, int]
     scheduling_steps: int = 1
+    max_edge_load_us: float = 0.0
 
     @property
     def effective_algobw_GBps(self) -> float:
@@ -84,6 +88,7 @@ class TokenStrategyResult:
     strategy: str
     dispatch: TokenPhaseResult
     combine: TokenPhaseResult
+    planning_time_us: float = 0.0
 
     @property
     def total_time_us(self) -> float:
@@ -97,19 +102,35 @@ class TokenStrategyResult:
 @dataclass(frozen=True)
 class TokenSimulationConfig:
     launch_overhead_us: float = 1.5
+    relay_overhead_us: float = 0.35
+    reduction_launch_overhead_us: float = 0.2
+    reduction_bandwidth_GBps: float = 200.0
     include_path_latency: bool = True
     tree_entries_per_node: int = 2
     pipeline_tokens: bool = True
     nccl_uncoordinated_contention_loss: float = 0.05
+    relaymoe_execution: str = "event_driven"
 
     def __post_init__(self) -> None:
         if self.launch_overhead_us < 0:
             raise ValueError("launch_overhead_us must be non-negative")
+        if self.relay_overhead_us < 0:
+            raise ValueError("relay_overhead_us must be non-negative")
+        if self.reduction_launch_overhead_us < 0:
+            raise ValueError(
+                "reduction_launch_overhead_us must be non-negative"
+            )
+        if self.reduction_bandwidth_GBps <= 0:
+            raise ValueError("reduction_bandwidth_GBps must be positive")
         if self.tree_entries_per_node < 1:
             raise ValueError("tree_entries_per_node must be positive")
         if not 0 <= self.nccl_uncoordinated_contention_loss < 1:
             raise ValueError(
                 "nccl_uncoordinated_contention_loss must be in [0, 1)"
+            )
+        if self.relaymoe_execution not in {"event_driven", "fluid"}:
+            raise ValueError(
+                "relaymoe_execution must be 'event_driven' or 'fluid'"
             )
 
 
@@ -138,15 +159,27 @@ def simulate_token_strategies(
     if tuple(topology.gpus) != routing.gpu_names:
         raise ValueError("routing GPU order does not match topology")
 
-    useful_bytes = sum(
-        (
-            route_mask
-            & ~routing.gpu_expert_masks[source]
-        ).bit_count()
-        * routing.activation_bytes
-        for source in sources
-        for route_mask in routing.route_masks[source]
-    )
+    gpu_index = {
+        gpu_name: index for index, gpu_name in enumerate(routing.gpu_names)
+    }
+    expert_gpu_bits = [
+        1 << gpu_index[gpu_name] for gpu_name in routing.expert_to_gpu
+    ]
+    useful_bytes = 0
+    for source in sources:
+        source_bit = 1 << source
+        for route_mask in routing.route_masks[source]:
+            dest_gpu_mask = 0
+            remaining = route_mask
+            while remaining:
+                least_bit = remaining & -remaining
+                expert = least_bit.bit_length() - 1
+                dest_gpu_mask |= expert_gpu_bits[expert]
+                remaining ^= least_bit
+            dest_gpu_mask &= ~source_bit
+            useful_bytes += (
+                dest_gpu_mask.bit_count() * routing.activation_bytes
+            )
 
     direct_templates = {
         source: _direct_template(topology, routing, source)
@@ -197,6 +230,33 @@ def simulate_token_strategies(
                 useful_bytes=useful_bytes,
                 config=simulation_config,
             )
+        elif strategy == "deepep":
+            dispatch = _simulate_deepep_phase(
+                topology,
+                routing,
+                sources=sources,
+                useful_bytes=useful_bytes,
+                config=simulation_config,
+            )
+            if simulation_config.pipeline_tokens:
+                combine = _summarize_mirrored_phase(
+                    topology,
+                    combine_flows,
+                    phase="combine",
+                    useful_bytes=useful_bytes,
+                    total_time_us=dispatch.total_time_us,
+                    peak_concurrency=dispatch.max_edge_concurrency,
+                    scheduling_steps=dispatch.scheduling_steps,
+                )
+            else:
+                combine = _simulate_phase(
+                    topology,
+                    combine_flows,
+                    phase="combine",
+                    useful_bytes=useful_bytes,
+                    exclusive_edges=frozenset(),
+                    config=simulation_config,
+                )
         else:
             dispatch = _simulate_phase(
                 topology,
@@ -211,7 +271,7 @@ def simulate_token_strategies(
                     else 0.0
                 ),
             )
-        if simulation_config.pipeline_tokens and strategy != "collway":
+        if simulation_config.pipeline_tokens and strategy not in {"collway", "deepep"}:
             combine = _summarize_mirrored_phase(
                 topology,
                 combine_flows,
@@ -221,7 +281,7 @@ def simulate_token_strategies(
                 peak_concurrency=dispatch.max_edge_concurrency,
                 scheduling_steps=dispatch.scheduling_steps,
             )
-        elif strategy != "collway":
+        elif strategy not in {"collway", "deepep"}:
             combine = _simulate_phase(
                 topology,
                 combine_flows,
@@ -290,6 +350,58 @@ def _deepep_template(
     return _template_from_parents(topology, routing, root, parents)
 
 
+def _simulate_deepep_phase(
+    topology: HierarchicalTopology,
+    routing: TokenRouting,
+    *,
+    sources: tuple[int, ...],
+    useful_bytes: int,
+    config: TokenSimulationConfig,
+) -> TokenPhaseResult:
+    deepep_templates = {
+        source: _deepep_template(topology, routing, source)
+        for source in sources
+    }
+    dispatch_flows = _compile_flows(
+        topology,
+        routing,
+        deepep_templates,
+        phase="dispatch",
+        preserve_dependencies=True,
+    )
+    return _simulate_phase(
+        topology,
+        dispatch_flows,
+        phase="dispatch",
+        useful_bytes=useful_bytes,
+        exclusive_edges=frozenset(),
+        config=config,
+    )
+
+
+def _event_phase_to_token_phase(
+    result: EventDrivenPhaseResult,
+) -> TokenPhaseResult:
+    return TokenPhaseResult(
+        phase=result.phase,
+        total_time_us=result.total_time_us,
+        useful_bytes=result.useful_bytes,
+        physical_bytes=result.physical_bytes,
+        flow_count=result.action_count,
+        edge_bytes=result.edge_bytes,
+        edge_peak_concurrency={
+            edge_name: 1 for edge_name in result.edge_bytes
+        },
+        scheduling_steps=len(
+            {
+                round(timing.start_us, 12)
+                for timing in result.action_timings.values()
+            }
+        ),
+        max_edge_load_us=result.max_edge_load_us,
+    )
+
+
 def _simulate_selective_token_trees(
     topology: HierarchicalTopology,
     routing: TokenRouting,
@@ -298,25 +410,72 @@ def _simulate_selective_token_trees(
     useful_bytes: int,
     config: TokenSimulationConfig,
 ) -> TokenStrategyResult:
-    rounds = _aggregate_selective_tree_rounds(
-        topology,
-        routing,
-        sources=sources,
-        entries_per_node=config.tree_entries_per_node,
-    )
-    simulate_rounds = (
-        _simulate_pipelined_tree_rounds
-        if config.pipeline_tokens
-        else _simulate_tree_rounds
-    )
-    dispatch = simulate_rounds(
-        topology,
-        rounds,
-        phase="dispatch",
-        useful_bytes=useful_bytes,
-        config=config,
-    )
+    if config.relaymoe_execution == "event_driven":
+        relaymoe = RelayMoE(topology)
+        plan = relaymoe.plan_from_token_routing(
+            routing,
+            source_indices=sources,
+        )
+        simulation = relaymoe.simulate(
+            plan,
+            launch_overhead_us=config.launch_overhead_us,
+            include_path_latency=config.include_path_latency,
+            relay_overhead_us=config.relay_overhead_us,
+            reduction_launch_overhead_us=(
+                config.reduction_launch_overhead_us
+            ),
+            reduction_bandwidth_GBps=config.reduction_bandwidth_GBps,
+        )
+        return TokenStrategyResult(
+            strategy="relaymoe",
+            dispatch=_event_phase_to_token_phase(simulation.dispatch),
+            combine=_event_phase_to_token_phase(simulation.combine),
+            planning_time_us=plan.planning_time_us,
+        )
+
+    traffic_classes = routing.group_traffic_classes(source_indices=sources)
+    if not traffic_classes:
+        empty = TokenPhaseResult(
+            phase="dispatch",
+            total_time_us=0.0,
+            useful_bytes=useful_bytes,
+            physical_bytes=0,
+            flow_count=0,
+            edge_bytes={},
+            edge_peak_concurrency={},
+            scheduling_steps=0,
+            max_edge_load_us=0.0,
+        )
+        return TokenStrategyResult(
+            strategy="relaymoe",
+            dispatch=empty,
+            combine=TokenPhaseResult(
+                phase="combine",
+                total_time_us=0.0,
+                useful_bytes=useful_bytes,
+                physical_bytes=0,
+                flow_count=0,
+                edge_bytes={},
+                edge_peak_concurrency={},
+                scheduling_steps=0,
+                max_edge_load_us=0.0,
+            ),
+        )
+
     if config.pipeline_tokens:
+        rounds, model_max_load_us = _select_binomial_tree_rounds_revision411(
+            topology,
+            routing,
+            sources=sources,
+        )
+        dispatch = _simulate_pipelined_tree_rounds(
+            topology,
+            rounds,
+            phase="dispatch",
+            useful_bytes=useful_bytes,
+            config=config,
+            override_max_edge_load_us=model_max_load_us,
+        )
         combine = _simulate_pipelined_tree_rounds(
             topology,
             rounds,
@@ -324,23 +483,435 @@ def _simulate_selective_token_trees(
             useful_bytes=useful_bytes,
             config=config,
             mirrored_time_us=dispatch.total_time_us,
-            mirrored_peak_concurrency=(
-                dispatch.max_edge_concurrency
-            ),
+            mirrored_peak_concurrency=dispatch.max_edge_concurrency,
+            override_max_edge_load_us=model_max_load_us,
         )
-    else:
-        combine = simulate_rounds(
-            topology,
-            rounds,
-            phase="combine",
-            useful_bytes=useful_bytes,
-            config=config,
+        return TokenStrategyResult(
+            strategy="relaymoe",
+            dispatch=dispatch,
+            combine=combine,
         )
+
+    rounds = _aggregate_selective_tree_rounds(
+        topology,
+        routing,
+        sources=sources,
+        entries_per_node=config.tree_entries_per_node,
+    )
+    dispatch = _simulate_tree_rounds(
+        topology,
+        rounds,
+        phase="dispatch",
+        useful_bytes=useful_bytes,
+        config=config,
+    )
+    combine = _simulate_tree_rounds(
+        topology,
+        rounds,
+        phase="combine",
+        useful_bytes=useful_bytes,
+        config=config,
+    )
     return TokenStrategyResult(
         strategy="relaymoe",
         dispatch=dispatch,
         combine=combine,
     )
+
+
+def _select_binomial_tree_rounds_revision411(
+    topology: HierarchicalTopology,
+    routing: TokenRouting,
+    *,
+    sources: tuple[int, ...],
+) -> tuple[tuple[dict[tuple[str, str], int], ...], float]:
+    """Revision-411 Offline Binomial Catalog + Online Phase I Exact Potential Selection."""
+
+    gpu_names = routing.gpu_names
+    gpu_index = {name: idx for idx, name in enumerate(gpu_names)}
+    expert_gpu_bits = [
+        1 << gpu_index[gpu_name] for gpu_name in routing.expert_to_gpu
+    ]
+
+    per_source_counts: list[tuple[int, list[tuple[int, int]]]] = []
+    total_dest_deliveries = 0
+    for source in sources:
+        source_bit = 1 << source
+        counts_for_source: dict[int, int] = {}
+        for route_mask in routing.route_masks[source]:
+            dest_gpu_mask = 0
+            remaining = route_mask
+            while remaining:
+                least_bit = remaining & -remaining
+                expert = least_bit.bit_length() - 1
+                dest_gpu_mask |= expert_gpu_bits[expert]
+                remaining ^= least_bit
+            dest_gpu_mask &= ~source_bit
+            if dest_gpu_mask:
+                counts_for_source[dest_gpu_mask] = (
+                    counts_for_source.get(dest_gpu_mask, 0) + 1
+                )
+                total_dest_deliveries += dest_gpu_mask.bit_count()
+        sorted_for_source = sorted(
+            counts_for_source.items(),
+            key=lambda item: -item[1],
+        )
+        per_source_counts.append((source, sorted_for_source))
+
+    classes: list[tuple[int, int, int]] = []
+    max_len = max((len(items) for _, items in per_source_counts), default=0)
+    for pos in range(max_len):
+        for source, items in per_source_counts:
+            if pos < len(items):
+                dest_gpu_mask, token_count = items[pos]
+                classes.append((source, dest_gpu_mask, token_count))
+    classes.sort(key=lambda item: -item[2])
+    if not classes:
+        return (), 0.0
+
+    switches = topology.switches()
+    sw_count = len(switches)
+    sw_index = {sw: idx for idx, sw in enumerate(switches)}
+    sw_node = tuple(topology.switch_node(sw) for sw in switches)
+    gpu_sw_idx = tuple(
+        sw_index[topology.gpus[name].switch] for name in gpu_names
+    )
+    gpus_on_sw = tuple(
+        tuple(
+            idx
+            for idx, name in enumerate(gpu_names)
+            if topology.gpus[name].switch == sw
+        )
+        for sw in switches
+    )
+    sw_bit_masks = []
+    for s_idx in range(sw_count):
+        m_bits = 0
+        for g_idx in gpus_on_sw[s_idx]:
+            m_bits |= 1 << g_idx
+        sw_bit_masks.append(m_bits)
+    sw_bit_masks_t = tuple(sw_bit_masks)
+
+    edge_names = list(topology.edges)
+    edge_idx_map = {name: idx for idx, name in enumerate(edge_names)}
+    gpu_up_e = tuple(
+        edge_idx_map[topology.gpu_up_edges[name]] for name in gpu_names
+    )
+    gpu_down_e = tuple(
+        edge_idx_map[topology.gpu_down_edges[name]] for name in gpu_names
+    )
+    pxb_e = {
+        (sw_index[s_u], sw_index[s_v]): edge_idx_map[ename]
+        for (s_u, s_v), ename in topology.pxb_edges.items()
+    }
+    nic_tx_e = tuple(
+        tuple(
+            edge_idx_map[ename]
+            for ename in topology.nic_tx_edges_by_switch[sw]
+        )
+        for sw in switches
+    )
+    nic_rx_e = tuple(
+        tuple(
+            edge_idx_map[ename]
+            for ename in topology.nic_rx_edges_by_switch[sw]
+        )
+        for sw in switches
+    )
+    model_edge_indices = tuple(
+        edge_idx_map[ename] for ename in topology.model_directed_edges()
+    )
+    d_edges = max(2, len(model_edge_indices))
+    lambda_stop = 2.0 * math.log(d_edges) + 3.0
+
+    sample_gpu = gpu_names[0]
+    gpu_bw = topology.edges[topology.gpu_up_edges[sample_gpu]].bytes_per_us
+    sample_sw = switches[0]
+    dev_tx = topology.nic_tx_edges_by_switch[sample_sw]
+    nic_bw = topology.edges[dev_tx[0]].bytes_per_us
+    nics_per_sw = len(dev_tx)
+
+    act_bytes = routing.activation_bytes
+    vol_gpu_unit = act_bytes / gpu_bw
+    vol_nic_unit = act_bytes / nic_bw
+    max_cnt = classes[0][2]
+    avg_down_lb = (
+        total_dest_deliveries
+        * act_bytes
+        / (max(1, len(gpu_names)) * gpu_bw * lambda_stop)
+    )
+    step_lb = max_cnt * 2.0 * max(vol_gpu_unit, vol_nic_unit)
+    theta = max(step_lb, avg_down_lb, 1e-9)
+
+    catalog = OfflineBinomialCatalog(max_variants=16)
+    skel_cache: dict[
+        tuple[tuple[int, ...], tuple[int, ...]],
+        tuple[tuple, ...],
+    ] = {}
+
+    def get_compiled_skels(
+        m_canon: tuple[int, ...],
+        canon_sw_to_node: tuple[int, ...],
+    ) -> tuple[tuple, ...]:
+        key = (canon_sw_to_node, m_canon)
+        cached = skel_cache.get(key)
+        if cached is not None:
+            return cached
+        raw_skels = catalog.lookup(m_canon, canon_sw_to_node, nics_per_sw)
+        compiled = []
+        for sk in raw_skels:
+            compiled.append(
+                (
+                    sk.root_out_deg,
+                    tuple(
+                        (csw, sk.nonzero_role_out_degs_by_csw[csw])
+                        for csw in sk.nonzero_role_out_degs_by_csw
+                    ),
+                    sk.pxb_canon_pairs,
+                    tuple(
+                        (csw, sk.nic_tx_slot_counts[csw])
+                        for csw in sk.nic_tx_slot_counts
+                    ),
+                    tuple(
+                        (csw, sk.nic_rx_slot_counts[csw])
+                        for csw in sk.nic_rx_slot_counts
+                    ),
+                    sk.role_order_by_csw,
+                    sk.role_out_degs_by_csw,
+                    sk.stages,
+                )
+            )
+        res = tuple(compiled)
+        skel_cache[key] = res
+        return res
+
+    # Precompute canonical switch ordering for each source switch index
+    local_sw_by_src = []
+    remote_sw_by_src = []
+    for s_idx in range(sw_count):
+        s_n = sw_node[s_idx]
+        loc = tuple(
+            other
+            for other in range(sw_count)
+            if sw_node[other] == s_n and other != s_idx
+        )
+        rem = tuple(
+            other for other in range(sw_count) if sw_node[other] != s_n
+        )
+        local_sw_by_src.append(loc)
+        remote_sw_by_src.append(rem)
+
+    total_edges = len(edge_names)
+    final_rounds: list[dict[tuple[str, str], int]] = []
+    final_max_load_us = 0.0
+    max_role_degree = max(
+        (dmask.bit_count().bit_length() for _, dmask, _ in classes),
+        default=1,
+    )
+
+    for _ in range(8):
+        tau = [0.0] * total_edges
+        exp_tau = [1.0] * total_edges
+        inv_2theta = 1.0 / (2.0 * theta)
+        coeff_gpu = {
+            (cnt, mult): math.expm1(
+                min(60.0, cnt * mult * vol_gpu_unit * inv_2theta)
+            )
+            for cnt in {c[2] for c in classes}
+            for mult in range(1, max_role_degree + 1)
+        }
+        coeff_nic = {
+            (cnt, mult): math.expm1(
+                min(60.0, cnt * mult * vol_nic_unit * inv_2theta)
+            )
+            for cnt in {c[2] for c in classes}
+            for mult in range(1, max_role_degree + 1)
+        }
+        rounds: list[dict[tuple[str, str], int]] = []
+
+        for src, dmask, cnt in classes:
+            src_sw = gpu_sw_idx[src]
+            c_sw = [
+                (dmask & sw_bit_masks_t[s_idx]).bit_count()
+                for s_idx in range(sw_count)
+            ]
+            local_other = sorted(
+                local_sw_by_src[src_sw],
+                key=lambda s_idx: (
+                    -c_sw[s_idx],
+                    (s_idx - src_sw) % sw_count,
+                ),
+            )
+            remote_sw = sorted(
+                remote_sw_by_src[src_sw],
+                key=lambda s_idx: (
+                    -c_sw[s_idx],
+                    (s_idx - src_sw) % sw_count,
+                ),
+            )
+            canon_to_actual = (src_sw, *local_other, *remote_sw)
+            node_order = {sw_node[src_sw]: 0}
+            for s_idx in remote_sw:
+                n_name = sw_node[s_idx]
+                if n_name not in node_order:
+                    node_order[n_name] = len(node_order)
+            canon_sw_to_node = tuple(
+                node_order[sw_node[s_idx]] for s_idx in canon_to_actual
+            )
+            m_canon = tuple(c_sw[s_idx] for s_idx in canon_to_actual)
+            skels = get_compiled_skels(m_canon, canon_sw_to_node)
+
+            sorted_gpus: dict[int, tuple[int, ...]] = {}
+            for csw, asw in enumerate(canon_to_actual):
+                if c_sw[asw] > 0:
+                    active_g = [
+                        g_idx
+                        for g_idx in gpus_on_sw[asw]
+                        if (dmask >> g_idx) & 1
+                    ]
+                    if len(active_g) > 1:
+                        active_g.sort(
+                            key=lambda g_idx: (
+                                tau[gpu_up_e[g_idx]],
+                                tau[gpu_down_e[g_idx]],
+                                g_idx,
+                            )
+                        )
+                    sorted_gpus[csw] = tuple(active_g)
+
+            best_score = math.inf
+            best_sk = None
+            for sk in skels:
+                root_deg, nz_roles, pxb_pairs, tx_slots, rx_slots, _, _, _ = sk
+                score = 0.0
+                if root_deg > 0:
+                    score += (
+                        exp_tau[gpu_up_e[src]] * coeff_gpu[(cnt, root_deg)]
+                    )
+                for csw, nz_list in nz_roles:
+                    gs = sorted_gpus[csw]
+                    for pos, deg in nz_list:
+                        score += (
+                            exp_tau[gpu_up_e[gs[pos]]]
+                            * coeff_gpu[(cnt, deg)]
+                        )
+                for (cu, cv), pcnt in pxb_pairs:
+                    e_pxb = pxb_e[(canon_to_actual[cu], canon_to_actual[cv])]
+                    score += exp_tau[e_pxb] * coeff_gpu[(cnt, pcnt)]
+                for csw, scnts in tx_slots:
+                    asw = canon_to_actual[csw]
+                    devs = nic_tx_e[asw]
+                    if len(devs) == 2:
+                        e0, e1 = devs[0], devs[1]
+                        order_devs = (e0, e1) if tau[e0] <= tau[e1] else (e1, e0)
+                    else:
+                        order_devs = tuple(sorted(devs, key=lambda e: tau[e]))
+                    for pos, (_, ncnt) in enumerate(scnts):
+                        score += (
+                            exp_tau[order_devs[pos % len(order_devs)]]
+                            * coeff_nic[(cnt, ncnt)]
+                        )
+                for csw, scnts in rx_slots:
+                    asw = canon_to_actual[csw]
+                    devs = nic_rx_e[asw]
+                    if len(devs) == 2:
+                        e0, e1 = devs[0], devs[1]
+                        order_devs = (e0, e1) if tau[e0] <= tau[e1] else (e1, e0)
+                    else:
+                        order_devs = tuple(sorted(devs, key=lambda e: tau[e]))
+                    for pos, (_, ncnt) in enumerate(scnts):
+                        score += (
+                            exp_tau[order_devs[pos % len(order_devs)]]
+                            * coeff_nic[(cnt, ncnt)]
+                        )
+                if score < best_score:
+                    best_score = score
+                    best_sk = sk
+
+            assert best_sk is not None
+            (
+                root_deg,
+                nz_roles,
+                pxb_pairs,
+                tx_slots,
+                rx_slots,
+                role_order,
+                role_degs,
+                stages,
+            ) = best_sk
+            v_gpu = cnt * vol_gpu_unit
+            v_nic = cnt * vol_nic_unit
+            if root_deg > 0:
+                e_up = gpu_up_e[src]
+                tau[e_up] += root_deg * v_gpu
+                exp_tau[e_up] = math.exp(min(60.0, tau[e_up] * inv_2theta))
+            role_map: dict[tuple[int, int], int] = {(0, -1): src}
+            for csw, roles in role_order.items():
+                gs = sorted_gpus[csw]
+                degs = role_degs[csw]
+                for pos, r_local in enumerate(roles):
+                    g_idx = gs[pos]
+                    role_map[(csw, r_local)] = g_idx
+                    e_dn = gpu_down_e[g_idx]
+                    tau[e_dn] += v_gpu
+                    exp_tau[e_dn] = math.exp(min(60.0, tau[e_dn] * inv_2theta))
+                    if degs[pos] > 0:
+                        e_up = gpu_up_e[g_idx]
+                        tau[e_up] += degs[pos] * v_gpu
+                        exp_tau[e_up] = math.exp(
+                            min(60.0, tau[e_up] * inv_2theta)
+                        )
+            for (cu, cv), pcnt in pxb_pairs:
+                e_pxb = pxb_e[(canon_to_actual[cu], canon_to_actual[cv])]
+                tau[e_pxb] += pcnt * v_gpu
+                exp_tau[e_pxb] = math.exp(min(60.0, tau[e_pxb] * inv_2theta))
+            for csw, scnts in tx_slots:
+                asw = canon_to_actual[csw]
+                devs = nic_tx_e[asw]
+                if len(devs) == 2:
+                    e0, e1 = devs[0], devs[1]
+                    order_devs = (e0, e1) if tau[e0] <= tau[e1] else (e1, e0)
+                else:
+                    order_devs = tuple(sorted(devs, key=lambda e: tau[e]))
+                for pos, (_, ncnt) in enumerate(scnts):
+                    e_nic = order_devs[pos % len(order_devs)]
+                    tau[e_nic] += ncnt * v_nic
+                    exp_tau[e_nic] = math.exp(
+                        min(60.0, tau[e_nic] * inv_2theta)
+                    )
+            for csw, scnts in rx_slots:
+                asw = canon_to_actual[csw]
+                devs = nic_rx_e[asw]
+                if len(devs) == 2:
+                    e0, e1 = devs[0], devs[1]
+                    order_devs = (e0, e1) if tau[e0] <= tau[e1] else (e1, e0)
+                else:
+                    order_devs = tuple(sorted(devs, key=lambda e: tau[e]))
+                for pos, (_, ncnt) in enumerate(scnts):
+                    e_nic = order_devs[pos % len(order_devs)]
+                    tau[e_nic] += ncnt * v_nic
+                    exp_tau[e_nic] = math.exp(
+                        min(60.0, tau[e_nic] * inv_2theta)
+                    )
+
+            vol_bytes = cnt * act_bytes
+            while len(rounds) < len(stages):
+                rounds.append(defaultdict(int))
+            for st_idx, st in enumerate(stages):
+                r_dict = rounds[st_idx]
+                for arc in st:
+                    gu = gpu_names[role_map[arc.src_role]]
+                    gv = gpu_names[role_map[arc.dst_role]]
+                    r_dict[(gu, gv)] += vol_bytes
+
+        max_load = max((tau[e] for e in model_edge_indices), default=0.0)
+        final_rounds = rounds
+        final_max_load_us = max_load
+        if max_load <= lambda_stop * theta:
+            break
+        theta *= 2.0
+
+    return tuple(dict(r) for r in final_rounds), final_max_load_us
 
 
 def _aggregate_selective_tree_rounds(
@@ -894,6 +1465,13 @@ def _simulate_collway_phase(
         edge_bytes=dict(edge_bytes),
         edge_peak_concurrency=dict(edge_peak_concurrency),
         scheduling_steps=len(stages),
+        max_edge_load_us=max(
+            (
+                topology.edges[edge_name].serialization_time_us(size_bytes)
+                for edge_name, size_bytes in edge_bytes.items()
+            ),
+            default=0.0,
+        ),
     )
 
 
@@ -1060,6 +1638,13 @@ def _summarize_mirrored_phase(
         edge_bytes=dict(edge_bytes),
         edge_peak_concurrency=peak,
         scheduling_steps=scheduling_steps,
+        max_edge_load_us=max(
+            (
+                topology.edges[edge_name].serialization_time_us(size_bytes)
+                for edge_name, size_bytes in edge_bytes.items()
+            ),
+            default=0.0,
+        ),
     )
 
 
@@ -1117,52 +1702,58 @@ def _simulate_phase(
 
     current_time_us = config.launch_overhead_us
     epsilon = 1e-9
+    rates: dict[int, float] = {}
+    rates_dirty = True
     while arrived < len(flows):
-        for flow_id in sorted(
-            tuple(ready),
-            key=lambda item: (
-                -critical_depth[item],
-                -flows[item].size_bytes,
-                item,
-            ),
-        ):
-            resources = flow_exclusive_resources[flow_id]
-            if occupied_exclusive.isdisjoint(resources):
-                ready.remove(flow_id)
-                active[flow_id] = float(flows[flow_id].size_bytes)
-                occupied_exclusive.update(resources)
+        if ready:
+            for flow_id in sorted(
+                tuple(ready),
+                key=lambda item: (
+                    -critical_depth[item],
+                    -flows[item].size_bytes,
+                    item,
+                ),
+            ):
+                resources = flow_exclusive_resources[flow_id]
+                if occupied_exclusive.isdisjoint(resources):
+                    ready.remove(flow_id)
+                    active[flow_id] = float(flows[flow_id].size_bytes)
+                    occupied_exclusive.update(resources)
+                    rates_dirty = True
 
-        edge_users: dict[str, list[int]] = defaultdict(list)
-        for flow_id in active:
-            for edge_name in flows[flow_id].physical_edges:
-                edge_users[edge_name].append(flow_id)
-        for edge_name, users in edge_users.items():
-            edge_peak_concurrency[edge_name] = max(
-                edge_peak_concurrency[edge_name],
-                len(users),
-            )
-
-        rates = _progressive_max_min_rates(
-            topology,
-            active.keys(),
-            flows,
-            edge_users,
-            edge_capacity_scales={
-                edge_name: _uncoordinated_efficiency(
+        if rates_dirty:
+            edge_users: dict[str, list[int]] = defaultdict(list)
+            for flow_id in active:
+                for edge_name in flows[flow_id].physical_edges:
+                    edge_users[edge_name].append(flow_id)
+            for edge_name, users in edge_users.items():
+                edge_peak_concurrency[edge_name] = max(
+                    edge_peak_concurrency[edge_name],
                     len(users),
-                    uncoordinated_contention_loss,
                 )
-                for edge_name, users in edge_users.items()
-                if topology.edges[edge_name].kind
-                in {
-                    "gpu_up",
-                    "gpu_down",
-                    "pxb",
-                    "nic_tx",
-                    "nic_rx",
-                }
-            },
-        )
+
+            rates = _progressive_max_min_rates(
+                topology,
+                active.keys(),
+                flows,
+                edge_users,
+                edge_capacity_scales={
+                    edge_name: _uncoordinated_efficiency(
+                        len(users),
+                        uncoordinated_contention_loss,
+                    )
+                    for edge_name, users in edge_users.items()
+                    if topology.edges[edge_name].kind
+                    in {
+                        "gpu_up",
+                        "gpu_down",
+                        "pxb",
+                        "nic_tx",
+                        "nic_rx",
+                    }
+                },
+            )
+            rates_dirty = False
         finish_delta = min(
             (
                 active[flow_id] / rates[flow_id]
@@ -1193,6 +1784,8 @@ def _simulate_phase(
             for flow_id, remaining in active.items()
             if remaining <= epsilon
         ]
+        if finished:
+            rates_dirty = True
         for flow_id in finished:
             del active[flow_id]
             occupied_exclusive.difference_update(
@@ -1224,6 +1817,13 @@ def _simulate_phase(
         flow_count=len(flows),
         edge_bytes=dict(edge_bytes),
         edge_peak_concurrency=dict(edge_peak_concurrency),
+        max_edge_load_us=max(
+            (
+                topology.edges[edge_name].serialization_time_us(size_bytes)
+                for edge_name, size_bytes in edge_bytes.items()
+            ),
+            default=0.0,
+        ),
     )
 
 
@@ -1236,6 +1836,7 @@ def _simulate_pipelined_tree_rounds(
     config: TokenSimulationConfig,
     mirrored_time_us: float | None = None,
     mirrored_peak_concurrency: int = 0,
+    override_max_edge_load_us: float | None = None,
 ) -> TokenPhaseResult:
     """Fluid limit of fine-grained contention-free token time slicing.
 
@@ -1269,7 +1870,7 @@ def _simulate_pipelined_tree_rounds(
         )
     compiled = tuple(flows)
     if mirrored_time_us is not None:
-        return _summarize_mirrored_phase(
+        res = _summarize_mirrored_phase(
             topology,
             compiled,
             phase=phase,
@@ -1277,16 +1878,30 @@ def _simulate_pipelined_tree_rounds(
             total_time_us=mirrored_time_us,
             peak_concurrency=mirrored_peak_concurrency,
         )
-    return _simulate_phase(
-        topology,
-        compiled,
-        phase=phase,
-        useful_bytes=useful_bytes,
-        # Fractional sharing represents fine-grained edge-disjoint time
-        # slices; no two packets need to occupy an edge simultaneously.
-        exclusive_edges=frozenset(),
-        config=config,
-    )
+    else:
+        res = _simulate_phase(
+            topology,
+            compiled,
+            phase=phase,
+            useful_bytes=useful_bytes,
+            # Fractional sharing represents fine-grained edge-disjoint time
+            # slices; no two packets need to occupy an edge simultaneously.
+            exclusive_edges=frozenset(),
+            config=config,
+        )
+    if override_max_edge_load_us is not None:
+        return TokenPhaseResult(
+            phase=res.phase,
+            total_time_us=res.total_time_us,
+            useful_bytes=res.useful_bytes,
+            physical_bytes=res.physical_bytes,
+            flow_count=res.flow_count,
+            edge_bytes=res.edge_bytes,
+            edge_peak_concurrency=res.edge_peak_concurrency,
+            scheduling_steps=max(1, len(rounds)),
+            max_edge_load_us=override_max_edge_load_us,
+        )
+    return res
 
 
 def _progressive_max_min_rates(

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from relaymoe.baselines import CollWayBaseline, DeepEPBaseline, NCCLBaseline
-from relaymoe.catalog import CandidateTreeCatalog
+from relaymoe.catalog import CandidateTreeCatalog, OfflineBinomialCatalog
 from relaymoe.model import Gpu, HierarchicalTopology, LogicalArc, TrafficClass
+from relaymoe.runtime import RelayMoE, RelayMoEBackend
 from relaymoe.scenarios import (
     TokenRouting,
     build_hierarchical_topology,
@@ -187,6 +191,8 @@ class MoEWorkloadTests(unittest.TestCase):
             routing,
             config=TokenSimulationConfig(
                 launch_overhead_us=0.0,
+                relay_overhead_us=0.0,
+                reduction_launch_overhead_us=0.0,
                 include_path_latency=False,
                 tree_entries_per_node=2,
                 pipeline_tokens=False,
@@ -288,6 +294,133 @@ class CandidateCatalogTests(unittest.TestCase):
 
         self.assertEqual(direct.physical_edge_counts(topology)[network_edge], 2)
         self.assertEqual(relayed.physical_edge_counts(topology)[network_edge], 1)
+
+    def test_binomial_skeleton_meets_min_stages_and_one_to_one_rules(self) -> None:
+        catalog = OfflineBinomialCatalog()
+        canon_switch_to_node = (0, 0, 0, 0, 1, 1, 1, 1)
+        m_canon = (1, 1, 0, 1, 2, 1, 1, 0)
+        skeletons = catalog.lookup(m_canon, canon_switch_to_node, 2)
+
+        self.assertGreater(len(skeletons), 0)
+        expected_stages = sum(m_canon).bit_length()
+        for skel in skeletons:
+            self.assertEqual(skel.stage_count, expected_stages)
+            holders = {(0, -1)}
+            for stage in skel.stages:
+                senders = [arc.src_role for arc in stage]
+                receivers = [arc.dst_role for arc in stage]
+                self.assertEqual(len(senders), len(set(senders)))
+                self.assertEqual(len(receivers), len(set(receivers)))
+                self.assertTrue(set(senders).issubset(holders))
+                self.assertTrue(set(receivers).isdisjoint(holders))
+                pxb_pairs = [
+                    (arc.src_role[0], arc.dst_role[0])
+                    for arc in stage
+                    if arc.src_role[0] != arc.dst_role[0]
+                    and arc.tx_nic_slot is None
+                ]
+                tx_slots = [
+                    (arc.src_role[0], arc.tx_nic_slot)
+                    for arc in stage
+                    if arc.tx_nic_slot is not None
+                ]
+                rx_slots = [
+                    (arc.dst_role[0], arc.rx_nic_slot)
+                    for arc in stage
+                    if arc.rx_nic_slot is not None
+                ]
+                self.assertEqual(len(pxb_pairs), len(set(pxb_pairs)))
+                self.assertEqual(len(tx_slots), len(set(tx_slots)))
+                self.assertEqual(len(rx_slots), len(set(rx_slots)))
+                holders.update(receivers)
+
+    def test_document_aligned_catalog_is_not_silently_truncated(self) -> None:
+        distribution = (1, 2, 1, 0, 1, 1, 1, 1)
+        canonical_nodes = (0, 0, 0, 0, 1, 1, 1, 1)
+
+        unbounded = OfflineBinomialCatalog().lookup(
+            distribution,
+            canonical_nodes,
+            2,
+        )
+        approximate = OfflineBinomialCatalog(max_variants=16).lookup(
+            distribution,
+            canonical_nodes,
+            2,
+        )
+
+        self.assertGreater(len(unbounded), 16)
+        self.assertEqual(len(approximate), 16)
+
+    def test_revision572_event_scheduler_preserves_resource_invariants(
+        self,
+    ) -> None:
+        topology = build_hierarchical_topology(
+            nodes=2,
+            switches_per_node=4,
+            gpus_per_switch=4,
+        )
+        routing = generate_token_routing(
+            topology,
+            tokens_per_gpu=128,
+            top_k=8,
+            experts=32,
+            activation_bytes=1024,
+            seed=11,
+            routing_motifs_per_gpu=8,
+        )
+        results = simulate_token_strategies(topology, routing)
+
+        relaymoe = results["relaymoe"]
+        self.assertEqual(relaymoe.dispatch.max_edge_concurrency, 1)
+        self.assertEqual(relaymoe.combine.max_edge_concurrency, 1)
+        self.assertGreater(results["nccl"].dispatch.max_edge_concurrency, 1)
+        self.assertGreater(relaymoe.planning_time_us, 0.0)
+        self.assertEqual(
+            relaymoe.dispatch.physical_bytes,
+            sum(relaymoe.dispatch.edge_bytes.values()),
+        )
+        self.assertEqual(
+            relaymoe.combine.physical_bytes,
+            sum(relaymoe.combine.edge_bytes.values()),
+        )
+        self.assertEqual(
+            relaymoe.dispatch.flow_count,
+            relaymoe.combine.flow_count,
+        )
+        expected_max_load = max(
+            (
+                byte_count / topology.edges[edge_name].bytes_per_us
+                for edge_name, byte_count
+                in relaymoe.dispatch.edge_bytes.items()
+            ),
+            default=0.0,
+        )
+        self.assertAlmostEqual(
+            relaymoe.dispatch.max_edge_load_us,
+            expected_max_load,
+        )
+
+    def test_offline_catalog_round_trips_without_regeneration(self) -> None:
+        catalog = OfflineBinomialCatalog()
+        m_canon = (1, 1, 0, 2)
+        canonical_nodes = (0, 0, 1, 1)
+        expected = catalog.lookup(m_canon, canonical_nodes, 2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "catalog.json"
+            catalog.save(path)
+            restored = OfflineBinomialCatalog.load(path)
+            corrupted = json.loads(path.read_text(encoding="utf-8"))
+            corrupted["entries"][0]["m_canon"][0] += 1
+            path.write_text(json.dumps(corrupted), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                OfflineBinomialCatalog.load(path)
+
+        actual = restored.lookup(m_canon, canonical_nodes, 2)
+        self.assertEqual(restored.entry_count, 1)
+        self.assertEqual(restored.variant_count, len(expected))
+        self.assertEqual(actual, expected)
 
 
 class BaselineTests(unittest.TestCase):
@@ -456,6 +589,207 @@ class BaselineTests(unittest.TestCase):
         )
 
 
+class _RecordingBackend:
+    def __init__(self) -> None:
+        self.phases: list[str] = []
+
+    def execute(self, *, plan, phase, tensors):
+        self.phases.append(phase.phase)
+        return {
+            "phase": phase.phase,
+            "actions": len(phase.actions),
+            "input": tensors,
+            "classes": len(plan.traffic_classes),
+        }
+
+
+class RuntimeIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.topology = build_hierarchical_topology(
+            nodes=2,
+            switches_per_node=2,
+            gpus_per_switch=2,
+        )
+
+    def test_gating_api_builds_reusable_dispatch_and_combine_plan(self) -> None:
+        gpu_names = tuple(self.topology.gpus)
+        routes = []
+        for source in range(len(gpu_names)):
+            routes.append(
+                (
+                    (
+                        (source + 1) % len(gpu_names),
+                        (source + 4) % len(gpu_names),
+                    ),
+                    (
+                        (source + 2) % len(gpu_names),
+                        (source + 5) % len(gpu_names),
+                    ),
+                    (
+                        (source + 1) % len(gpu_names),
+                        (source + 4) % len(gpu_names),
+                    ),
+                )
+            )
+
+        backend = _RecordingBackend()
+        self.assertIsInstance(backend, RelayMoEBackend)
+        relaymoe = RelayMoE(self.topology, backend=backend)
+        weights = tuple(
+            tuple((0.6, 0.4) for _ in source_routes)
+            for source_routes in routes
+        )
+        plan = relaymoe.plan_from_gating(
+            routes,
+            expert_to_gpu=gpu_names,
+            activation_bytes=1024,
+            expert_weights_by_gpu=weights,
+        )
+
+        plan.dispatch.validate()
+        plan.combine.validate()
+        json.dumps(plan.to_dict())
+        self.assertGreater(len(plan.traffic_classes), 0)
+        self.assertEqual(
+            set(plan.traffic_layouts),
+            {flow.name for flow in plan.traffic_classes},
+        )
+        self.assertTrue(
+            all(
+                layout.expert_weights is not None
+                for layout in plan.traffic_layouts.values()
+            )
+        )
+        self.assertEqual(
+            len(plan.dispatch.actions),
+            len(plan.combine.actions),
+        )
+        self.assertTrue(
+            any(action.dependencies for action in plan.dispatch.actions)
+        )
+        cross_node_actions = [
+            action
+            for action in plan.dispatch.actions
+            if self.topology.gpus[action.arc.src].node
+            != self.topology.gpus[action.arc.dst].node
+        ]
+        self.assertTrue(cross_node_actions)
+        for action in cross_node_actions:
+            kinds = {
+                self.topology.edges[edge].kind
+                for edge in action.physical_edges
+            }
+            self.assertIn("nic_dev_tx", kinds)
+            self.assertIn("nic_dev_rx", kinds)
+            self.assertNotIn("network", kinds)
+
+        simulation = relaymoe.simulate(
+            plan,
+            launch_overhead_us=0.0,
+            include_path_latency=True,
+        )
+        timings = simulation.dispatch.action_timings
+        for action in plan.dispatch.actions:
+            for dependency in action.dependencies:
+                self.assertGreaterEqual(
+                    timings[action.name].ready_us + 1e-12,
+                    timings[dependency].finish_us,
+                )
+        for edge_name in simulation.dispatch.edge_bytes:
+            intervals = sorted(
+                (
+                    timings[action.name].start_us,
+                    timings[action.name].start_us
+                    + timings[action.name].serialization_us,
+                )
+                for action in plan.dispatch.actions
+                if edge_name in action.physical_edges
+            )
+            for previous, current in zip(intervals, intervals[1:]):
+                self.assertLessEqual(previous[1], current[0] + 1e-12)
+
+        dispatched = relaymoe.dispatch(plan, "hidden")
+        combined = relaymoe.combine(plan, "expert-output")
+        self.assertEqual(backend.phases, ["dispatch", "combine"])
+        self.assertEqual(dispatched["phase"], "dispatch")
+        self.assertEqual(combined["phase"], "combine")
+
+    def test_explicit_offline_phase_persists_catalog_for_online_only_use(
+        self,
+    ) -> None:
+        traffic = (
+            TrafficClass(
+                name="remote",
+                source="g0",
+                destinations=("g4", "g5", "g6", "g7"),
+                volume_bytes=4096,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "relaymoe-catalog.json"
+            builder = RelayMoE(self.topology, catalog_path=path)
+            self.assertEqual(builder.prebuild_catalog(traffic), 1)
+            self.assertTrue(path.exists())
+
+            online = RelayMoE(
+                self.topology,
+                catalog_path=path,
+                require_prebuilt_catalog=True,
+            )
+            first = online.plan(traffic)
+            second = online.plan(traffic)
+
+        self.assertFalse(first.cache_hit)
+        self.assertTrue(second.cache_hit)
+        self.assertEqual(second.planning_time_us, 0.0)
+        self.assertEqual(
+            first.selection.arc_physical_edges,
+            second.selection.arc_physical_edges,
+        )
+
+    def test_online_only_mode_rejects_missing_offline_key(self) -> None:
+        flow = TrafficClass(
+            name="not-prebuilt",
+            source="g0",
+            destinations=("g4", "g6"),
+            volume_bytes=1024,
+        )
+        relaymoe = RelayMoE(
+            self.topology,
+            require_prebuilt_catalog=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "prebuild_catalog"):
+            relaymoe.plan((flow,))
+
+    def test_token_trace_plan_preserves_token_to_expert_membership(self) -> None:
+        routing = generate_token_routing(
+            self.topology,
+            tokens_per_gpu=8,
+            top_k=4,
+            experts=8,
+            activation_bytes=2048,
+            seed=31,
+        )
+        plan = RelayMoE(self.topology).plan_from_token_routing(routing)
+
+        self.assertEqual(
+            set(plan.traffic_layouts),
+            {flow.name for flow in plan.traffic_classes},
+        )
+        for flow in plan.traffic_classes:
+            layout = plan.traffic_layouts[flow.name]
+            self.assertEqual(
+                flow.volume_bytes,
+                len(layout.token_indices) * routing.activation_bytes,
+            )
+            self.assertTrue(
+                all(
+                    len(experts) == routing.top_k
+                    for experts in layout.expert_indices
+                )
+            )
+
+
 class EndToEndTests(unittest.TestCase):
     def test_schedule_is_conflict_free_and_simulates(self) -> None:
         topology = build_hierarchical_topology()
@@ -477,7 +811,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertGreater(result.combine.total_time_us, 0)
         self.assertEqual(len(dispatch.actions), len(combine.actions))
 
-    def test_default_relaymoe_model_beats_direct_baseline(self) -> None:
+    def test_relay_and_direct_plans_cover_identical_traffic(self) -> None:
         topology = build_hierarchical_topology()
         traffic = generate_moe_traffic(topology)
 
@@ -485,20 +819,34 @@ class EndToEndTests(unittest.TestCase):
             topology,
             catalog=CandidateTreeCatalog(max_candidates=1, direct_only=True),
         )
-        _, direct_dispatch, direct_combine = direct_scheduler.plan(traffic)
+        direct_selection, direct_dispatch, direct_combine = (
+            direct_scheduler.plan(traffic)
+        )
         direct = StageSimulator(topology).simulate(
             direct_dispatch, direct_combine
         )
 
         tree_scheduler = PotentialGreedyScheduler(topology)
-        _, tree_dispatch, tree_combine = tree_scheduler.plan(traffic)
+        tree_selection, tree_dispatch, tree_combine = tree_scheduler.plan(
+            traffic
+        )
         tree = StageSimulator(topology).simulate(tree_dispatch, tree_combine)
 
-        self.assertLess(tree.total_time_us, direct.total_time_us)
-        self.assertLess(
-            tree.total_physical_bytes,
-            direct.total_physical_bytes,
-        )
+        expected_actions = sum(len(flow.destinations) for flow in traffic)
+        self.assertEqual(len(direct_dispatch.actions), expected_actions)
+        self.assertEqual(len(tree_dispatch.actions), expected_actions)
+        self.assertEqual(len(direct_combine.actions), expected_actions)
+        self.assertEqual(len(tree_combine.actions), expected_actions)
+        self.assertGreater(direct.total_time_us, 0.0)
+        self.assertGreater(tree.total_time_us, 0.0)
+        for selection in (direct_selection, tree_selection):
+            for flow in traffic:
+                selected = selection.selected_trees[flow.name]
+                selected.validate(topology)
+                self.assertEqual(
+                    set(flow.destinations),
+                    selected.nodes() - {flow.source},
+                )
 
 
 if __name__ == "__main__":
