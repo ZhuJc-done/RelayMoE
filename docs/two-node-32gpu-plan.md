@@ -45,7 +45,7 @@ daemon；启动方法见 `two-node-sync.md`。两机新容器均用 `docker/cros
 
 | 顺序 | 内容 | 最小配置和验收 |
 | --- | --- | --- |
-| 0 | 环境、资源、网络验收 | 镜像 ID/源码/模型 SHA 一致；两机无外部 GPU 作业；32 rank 可连接；GPU↔NIC 拓扑与端口日志归档 |
+| 0 | 环境、资源、网络验收 | 镜像实际配置/层摘要、源码、模型 SHA 一致；两机无外部 GPU 作业；32 rank 可连接；GPU↔NIC 拓扑与端口日志归档 |
 | 1 | 链路校准 | 每机 1 GPU 起步；4 KiB/64 KiB/1 MiB/16 MiB 单向与双向；单 NIC，再 8 NIC 并发；确认 RDMA/GDR 或明确记录回退 |
 | 2 | 真实传输与正确性 | 2×1→2×4→2×16；dispatch 精确匹配；FP32/BF16 Combine 检查；空 rank、全本地、全远端、非均衡、混合路由、连续 buffer 复用 |
 | 3 | 通信主扫描 | EP32、256 experts、top8、hidden2048、BF16；T/rank=1/5/21/84/335/670；RelayMoE/NCCL/CollWay-like/DeepEP（安装验证通过后） |

@@ -1,7 +1,8 @@
 # relay1 / relay2 同步与进入环境
 
-日期：2026-11-22。用户已授权在 relay2 创建 `zjc/test_real_moe` 并 push 到 origin，
-relay1 从 origin 拉取。模型、镜像、缓存和原始实验数据通过两机内网另行同步。
+日期：2026-11-22。已在 relay2 创建 `zjc/test_real_moe` 并 push 到 origin，
+relay1 已从 origin 拉取。初始实现提交为 `3d8eb46672bc580ec4089cf033192f3e4ad7af5a`；
+本文件的后续验收记录随同一分支提交。模型、镜像、缓存和原始实验数据已通过两机内网同步。
 Git 不承载权重、镜像层或大体积原始结果；`artifacts/`、`third_party/` 被忽略。
 固定第三方版本：DeepEP `95acda3a8d3c8a278fdfca293473a7f1887f593b`。
 
@@ -68,10 +69,34 @@ git pull --ff-only origin zjc/test_real_moe
 
 ## 校验与实验状态
 
-同步完成后记录：源码/模型/缓存 SHA256、镜像内容标识、Git HEAD、容器挂载、
-Python/PyTorch/CUDA/NCCL/vLLM 版本与 GPU/RDMA 可见性。
-详见 `artifacts/two-node-32gpu/setup/` 中的同步验收文件。
+同步验收通过：
+
+- 26 个模型文件合计 61,084,198,898 bytes（56.89 GiB），两机逐文件 SHA256 一致，
+  同时匹配原始下载 manifest。
+- 76 个 Git 文件、1,360 个单机实验产物、51,970 个缓存文件/符号链接、106 个
+  第三方文件的内容/链接目标一致。缓存含 vLLM venv；GPU JIT 后续可能生成新缓存。
+- Python 3.11.13、PyTorch 2.11.0+cu130、CUDA runtime 13.0、nvcc 13.1.115、
+  NCCL 2.28.9 一致；venv 为 vLLM 0.20.0、Transformers 4.57.6。
+  两机成功 import torch、vllm、vllm._C、transformers 和工作区 relaymoe。
+- 新容器 `zjc_relaymoe_cross` 已在两机启动，挂载路径、RDMA设备、GPU可见性一致，
+  容器仅有 docker-init 和 sleep。23项CPU单元测试通过；本轮没有启动GPU计算基准。
+
+镜像存储方式不同，Docker 显示 ID 的层级不同：
+
+| 标识 | 摘要 |
+| --- | --- |
+| relay2 OCI index | `sha256:faacddda8151aa8f9c29c90f87172e1c425ea0bd0369563c31b30b24226b59ba` |
+| index 中 amd64 manifest | `sha256:86113c515108cefce1f07e1ac53dd09cbadf53da5d5a9e340fd89de44c56fbe4` |
+| 该 manifest 的 config / relay1 image ID | `sha256:797faab7f6ea79c6332d352a01850bf8f3e29388fa62d0e233f5ebb18ed679ee` |
+
+已从 relay2 containerd 内容库核对 index→manifest→config 链；两机121个RootFS层、
+运行Config、架构与创建时间均一致。不是重新构建出的不同运行环境。
+
+详细同步验收文件位于两机及本地 `artifacts/two-node-32gpu/setup/`。
+原始校验清单位于两机 `/data07/fy/relaymoe-sync/20261122`；文件直传未删除源文件。
 
 2026-11-22 11:29 初始快照：relay2 有16个其他 Python GPU 进程；relay1 无可见
 compute进程，但15张卡利用率报告100%、显存仅3–19MiB。此记录不是资源预约或
-可运行结论，需要启动前复核。此轮只做文件/镜像同步和轻量环境验收，不启动32卡性能实验。
+可运行结论，需要启动前复核。11:37终检仍见relay2的16个外部GPU进程，采样显存约
+44–56 GiB、利用率99%；relay1依然无可见compute进程而大多数卡利用率报告100%。
+此轮只做文件/镜像同步和轻量环境验收，不启动32卡性能实验，也不重置GPU或停止外部进程。
